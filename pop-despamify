@@ -1,0 +1,204 @@
+#!/usr/bin/perl
+#
+# $Id$
+#
+# TODO:
+# * Print data size remaining.
+# * Put the correct address in the from line.
+# * Flush spam output rather than close/re-open.
+
+use Getopt::Mixed 1.006;
+use Mail::POP3Client 2.15;
+use Mail::SpamAssassin 3.0;
+use Term::ReadKey;
+use strict;
+use warnings;
+
+use constant SPAM_OUTPUT_PATH => "/tmp/spam/sa-learn-later";
+use constant DEFAULT_SPAM_THRESHOLD => 15;
+use constant HEADER_TRUNC_LENGTH => 25;
+#use constant MAX_MESSAGE_SIZE_TO_TEST => 25; # 25k
+#use constant MAX_MESSAGE_TEST_TIME => 1;
+
+our $opt_quiet;
+our $opt_verbose;
+our $opt_delete;
+our $opt_username;
+our $opt_password;
+our $opt_server;
+our $opt_threshold;
+our $opt_debug;
+
+Getopt::Mixed::getOptions("quiet q>quiet " .
+    "verbose v>verbose " .
+    "delete d>delete " .
+    "username=s u>username " .
+    "password=s p>password " .
+    "server=s s>server " .
+    "threshold=i t>threshold " .
+    "debug");
+
+$opt_username or
+die "Username specified in --username must not be zero-length";
+
+$opt_threshold or
+$opt_threshold = DEFAULT_SPAM_THRESHOLD;
+
+$opt_server =~ /([a-z]+\.)+[a-z]+/ or
+die "Server name specified in --server not valid";
+
+if (!($opt_password))
+{
+    print("Specify password: ");
+    ReadMode 'noecho';
+    $opt_password = ReadLine(0);
+    chomp $opt_password;
+    ReadMode 'normal';
+    print("\n");
+}
+
+my $spamtest = new Mail::SpamAssassin();
+
+my $popconnection = new Mail::POP3Client(USER      => $opt_username,
+    PASSWORD  => $opt_password,
+    HOST      => $opt_server,
+    DEBUG     => $opt_debug);
+my $mailcount = $popconnection->Count();
+
+($mailcount > 0) or die "Connection to $opt_server failed";
+
+print "Connection opened.\n" if (!$opt_quiet);
+
+my $deletedcount = 0;
+my $hamsize = 0;
+my $spamsize = 0;
+
+for (my $currentmsg = 1; $currentmsg <= $mailcount; $currentmsg++)
+{
+    my @message_all = $popconnection->Retrieve($currentmsg) or
+    die $popconnection->Message();
+
+    my ($subject, $from, $message_string);
+
+    foreach (@message_all)
+    {
+        $message_string .= "$_\n";
+        ($_ =~ /^Subject:\s+(.*)/i and !$subject) and $subject = $1;
+        ($_ =~ /^From:\s+(.*)/i and !$from) and $from = $1;
+    }
+
+    !$subject and $subject = "";
+    !$from and $from = "";
+
+    my $uidl = $popconnection->Uidl($currentmsg) or
+    die "Could not retrieve UIDL value for message $currentmsg";
+    $uidl = (split(/\s/, $uidl))[1];
+
+    my $size = $popconnection->List($currentmsg) or
+    die "Could not retrieve size for message $currentmsg";
+    $size = ((split(/\s/, $size))[1]) / 1024;
+
+    my $isspam = 0;
+    my $hits = 0;
+    my $status;
+
+    # FIXME: This commented-out code was part of an aborted attempt to only
+    # test messages under a certain size. It was never finished.
+
+    # if($size < MAX_MESSAGE_SIZE_TO_TEST)
+    # {
+
+    #     eval
+    #     {
+    #         local $SIG{ALRM} = sub { die "abort\n" };
+    #         alarm MAX_MESSAGE_TEST_TIME;
+
+    my $parsed_message = $spamtest->parse($message_string);
+    $status = $spamtest->check($parsed_message);
+    $hits = $status->get_score();
+    $isspam = $hits > $opt_threshold;
+
+    # alarm 0;
+    # };
+    # if($@ =~ /abort\n/)
+    # {
+    # warn "Spam testing timed out. Marked as ham";
+    # $isspam = 0;
+    # $hits = 0;
+    # }
+
+    # }
+    # else
+    # {
+    # warn "WARNING: Oversize - not checked" if (!$opt_quiet);
+    # }
+
+    if ($opt_verbose || ($isspam && !$opt_quiet))
+    {
+        print "${currentmsg}/${mailcount}:";
+        print sprintf("%.1f", $hits) . "/${opt_threshold}:";
+        print $isspam ? "S" : "H";
+        print ":";
+        print $isspam ? ($opt_delete ? "D" : "Sk") : "Kp";
+        print " " . substr($uidl, 0, HEADER_TRUNC_LENGTH - 1);
+        print " (" . sprintf("%.1f", $size) . "k)";
+        print " F: " . substr($from, 0, HEADER_TRUNC_LENGTH - 1);
+        print " S: " . substr($subject, 0, HEADER_TRUNC_LENGTH -1);
+        print "\n";
+    }
+
+    if ($isspam)
+    {
+        if ($opt_delete)
+        {
+            my $SPAM_OUTPUT_FILE;
+            my $rewritten_message = $status->rewrite_mail();
+
+            open ($SPAM_OUTPUT_FILE, ">>" . SPAM_OUTPUT_PATH)
+                or die "Cannot open spam output file";
+            flock ($SPAM_OUTPUT_FILE, 2)
+                or die "Cannot lock spam output file";
+            print $SPAM_OUTPUT_FILE "From - " . scalar(localtime) . "\n";
+            print $SPAM_OUTPUT_FILE $rewritten_message, "\n\n";
+            flock ($SPAM_OUTPUT_FILE, 8)
+                or die "Cannot unlock spam output file";
+            close $SPAM_OUTPUT_FILE
+                or die "Cannot close spam output file";
+
+            $popconnection->Delete($currentmsg)
+                or die "Could not delete spam message from server";
+        }
+        else
+        {
+            warn "WARNING: Deletion required but no deletion option"
+        }
+
+        $deletedcount++;
+        $spamsize += $size;
+    }
+    else
+    {
+        $hamsize += $size;
+    }
+}
+
+$popconnection->Close();
+
+if (!$opt_quiet)
+{
+    my $deletedcountp = $deletedcount / $mailcount * 100;
+
+    print "Connection closed.\n";
+
+    print "$deletedcount mails " .
+    ($opt_delete ? "deleted (" : "would have been deleted (") .
+    sprintf("%.0f", $deletedcountp) . "% of all mail), " .
+    sprintf("%.0f", $mailcount - $deletedcount) . " mails " .
+    ($opt_delete ? "remaining. " : "would remain. ");
+
+    print sprintf("%.0f", $spamsize) . "k " .
+    ($opt_delete ? "deleted, " : "would have been deleted, ");
+
+    print sprintf("%.0f", $hamsize) . "k " .
+    ($opt_delete ? "remaining.\n" : "would remain.\n");
+}

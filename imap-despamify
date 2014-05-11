@@ -1,0 +1,212 @@
+#!/usr/bin/perl
+#
+# $Id$
+#
+# The argument to --deletion_delta can be any negative delta that it is valid
+# to use with Date::Manip (see its manpage).
+#
+# TODO:
+# - Add message sizes.
+# - Append report directly to mailbox - use Mail::Internet to create.
+
+use strict;
+use warnings;
+
+require 'assert.pl';
+
+use Date::Manip;
+use Getopt::Mixed 1.006;
+use IO::Socket::SSL;
+use LockFile::Simple qw(lock unlock);
+use Mail::IMAPClient;
+use Mail::SpamAssassin 3.0;
+use Term::ReadKey;
+
+use constant LOCKFILE => "/var/lock/imap-despamify";
+use constant DEFAULT_POSSIBLE_THRESHOLD => 10;
+use constant DEFAULT_DEFINITE_THRESHOLD => 20;
+use constant DEFAULT_INBOX => 'INBOX';
+use constant DEFAULT_POSSIBLE_MAILBOX => 'mail/PossibleSpam';
+use constant DEFAULT_DEFINITE_MAILBOX => 'mail/Spam';
+use constant DEFAULT_DELETION_DELTA => '- 2 weeks';
+
+our $opt_debug;
+our $opt_definite_mailbox;
+our $opt_definite_threshold;
+our $opt_deletion_delta;
+our $opt_inbox;
+our $opt_password;
+our $opt_possible_mailbox;
+our $opt_possible_threshold;
+our $opt_server;
+our $opt_username;
+our $opt_verbose;
+
+Getopt::Mixed::getOptions("verbose v>verbose " .
+    "username=s u>username " .
+    "password=s p>password " .
+    "server=s s>server " .
+    "possible-threshold=i a>possible-threshold " .
+    "definite-threshold=i b>definite-threshold " .
+    "deletion-delta=s " .
+    "inbox=s " .
+    "possible-mailbox=s " .
+    "definite-mailbox=s " .
+    "debug d>debug");
+
+$opt_username or
+die "Username specified in --username must not be zero-length";
+
+$opt_server =~ /([a-z]+\.)+[a-z]+/ or
+die "Server name specified in --server not valid";
+
+if (!($opt_password))
+{
+    print("Specify password: ");
+    ReadMode 'noecho';
+    $opt_password = ReadLine(0);
+    chomp $opt_password;
+    ReadMode 'normal';
+    print("\n");
+}
+
+$opt_possible_threshold or
+$opt_possible_threshold = DEFAULT_POSSIBLE_THRESHOLD;
+
+$opt_definite_threshold or
+$opt_definite_threshold = DEFAULT_DEFINITE_THRESHOLD;
+
+assert('$opt_possible_threshold < $opt_definite_threshold');
+
+$opt_deletion_delta or
+$opt_deletion_delta = DEFAULT_DELETION_DELTA;
+
+$opt_inbox or
+$opt_inbox = DEFAULT_INBOX;
+
+$opt_possible_mailbox or
+$opt_possible_mailbox = DEFAULT_POSSIBLE_MAILBOX;
+
+$opt_definite_mailbox or
+$opt_definite_mailbox = DEFAULT_DEFINITE_MAILBOX;
+
+if ($opt_debug)
+{
+    print("Server: " . $opt_server . "\n");
+    print("Username: " . $opt_username . "\n");
+    print("Inbox: " . $opt_inbox . "\n");
+    print("Deletion Delta: " . $opt_deletion_delta . "\n");
+    print("Possible Mailbox: " . $opt_possible_mailbox . "\n");
+    print("Definite Mailbox: " . $opt_definite_mailbox . "\n");
+    print("Possible Threshold: " . $opt_possible_threshold . "\n");
+    print("Definite Threshold: " . $opt_definite_threshold . "\n");
+}
+
+lock(LOCKFILE . "-" . $opt_server) or die "Cannot lock lockfile!";
+
+my $ssl = IO::Socket::SSL->new(
+    Proto=>'tcp',
+    SSL_verify_mod=>0x00,
+    PeerAddr=>$opt_server,
+    PeerPort=>993) or die "SSL Socket Creation Failed";
+
+<$ssl>;
+
+my $imap = Mail::IMAPClient->new(
+    Socket => $ssl,
+    User => $opt_username,
+    Password => $opt_password,
+    Peek => 1,
+    Uid => 1,
+    Debug => $opt_debug) or die "IMAP Object Creation Failed";
+
+$imap->State ($imap->Connected);
+$imap->login() or die "IMAP Login Failed";
+
+my $spamtest = Mail::SpamAssassin->new();
+
+$imap->select($opt_inbox) or die "Cannot select inbox";
+
+print $imap->message_count() . " messages in inbox\n" if $opt_verbose;
+
+foreach my $uid ($imap->messages())
+{
+    my $headers = $imap->parse_headers($uid, "From", "Subject", "Message-ID")
+        or die "Error parsing headers";
+
+    $headers->{'From'}->[0] or $headers->{'From'}->[0] = "";
+    $headers->{'Subject'}->[0] or $headers->{'Subject'}->[0] = "";
+    $headers->{'Message-ID'}->[0] or $headers->{'Message-ID'}->[0] = "";
+
+    my $message = $imap->message_string($uid)
+        or die "Error getting message string";
+    my $messageObject = $spamtest->check_message_text($message);
+    my $score = $messageObject->get_score();
+    my $answer = 0;
+
+    if ($score >= $opt_possible_threshold)
+    {
+        my $rewrittenMessage = $messageObject->rewrite_mail();
+
+        my $moveFolder = $opt_possible_mailbox;
+        $answer = 1;
+        if ($score >= $opt_definite_threshold)
+        {
+            $moveFolder = $opt_definite_mailbox;
+            $answer = 2;
+        }
+
+        my $appendStatus = $imap->append_string($moveFolder, $rewrittenMessage)
+            or die "Error moving message " . $uid . " to folder " . $moveFolder . "!\n";
+
+        $imap->delete_message($uid) or die "Error deleting message";
+    }
+
+    $messageObject->finish();
+
+    print "(Uid:" . $uid . ") (scr:" . sprintf("%3.1f", $score) . ") (ans:" . $answer . ") (from) " .
+    $headers->{'From'}->[0] . " (subj) " . $headers->{'Subject'}->[0] .
+    " (msg-id) " . $headers->{'Message-ID'}->[0] . "\n" if $opt_verbose;
+}
+
+$imap->close() or die "Error closing mailbox";
+$imap->select($opt_definite_mailbox) or die "Error selecting definite mailbox";
+
+# Note: I think the following code should work well with timezones, but even
+# if not, since it is designed to work with time gaps of > 1 day (because that
+# is the granularity of an RFC 2060 date), this shouldn't cause a major
+# problem.
+
+print $imap->message_count() . " messages in definite spam box\n" if $opt_verbose;
+
+my $datebefore = Mail::IMAPClient->Rfc2060_date(UnixDate(DateCalc("now", $opt_deletion_delta), "%s"));
+
+print "Date before which should be deleted: " . $datebefore . "\n"
+if $opt_debug;
+
+# The following before() clause will compare with the internal date of the
+# message on the SMTP server, which in this case is the date and time it was
+# appended to the spam folder (since no date is passed in on the
+# append_string() call above) - which is clearly correct for our purposes.
+
+foreach my $uid ($imap->before($datebefore))
+{
+    my $headers = $imap->parse_headers($uid, "From", "Subject", "Message-ID")
+        or die "Error parsing headers";
+
+    $headers->{'From'}->[0] or $headers->{'From'}->[0] = "";
+    $headers->{'Subject'}->[0] or $headers->{'Subject'}->[0] = "";
+    $headers->{'Message-ID'}->[0] or $headers->{'Message-ID'}->[0] = "";
+
+    print "Deleting (Uid:" . $uid . ") (from) " .
+    $headers->{'From'}->[0] . " (subj) " . $headers->{'Subject'}->[0] .
+    " (msg-id) " . $headers->{'Message-ID'}->[0] . "\n" if $opt_verbose;
+
+    $imap->delete_message($uid) or die "Error deleting message";
+}
+
+$imap->close() or die "Error closing mailbox";
+$imap->logout() or die "Error logging out";
+$ssl->close();
+
+unlock(LOCKFILE . "-" . $opt_server);
